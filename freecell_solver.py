@@ -228,5 +228,9 @@ if __name__ == "__main__":
         for i,move in enumerate(solution_path,1):
             print(f"{i}. {move}")
         print("\nGame Over: All cards in Foundation!")
+        print("\nsaving solution to solution.txt...")
+        with open("solution.txt", "w") as f:
+            for i,move in enumerate(solution_path,1):
+                f.write(f"{i}. {move}\n")
     else:
         print("\nNo solution found.")
