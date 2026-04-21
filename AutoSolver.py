@@ -1,4 +1,5 @@
 import argparse
+import ctypes
 import re
 import socket
 import struct
@@ -10,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from pywinauto import Application, Desktop, mouse
+from pywinauto import Application, Desktop
 
 from freecell_solver import (
     CARD_PORT,
@@ -23,6 +24,16 @@ from freecell_solver import (
 
 SUIT_INDEX = {"S": 0, "D": 1, "H": 2, "C": 3}
 MOVE_RE = re.compile(r"^Move (?P<card>\S+) from (?P<src>.+?) to (?P<dst>.+)$")
+
+# Toggle this back to False if you want AutoSolver to replay foundation moves explicitly.
+SKIP_FOUNDATION_MOVES = False
+# Keep invalid-move dialogs visible in the logs and fail fast after dismissing them.
+INVALID_MOVE_IS_FATAL = True
+
+WM_MOUSEMOVE = 0x0200
+WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP = 0x0202
+MK_LBUTTON = 0x0001
 
 
 @dataclass
@@ -48,27 +59,69 @@ class AutoSolver:
         self.exe_path = self.base_dir / "Group_Project_T2" / "freecell.exe"
         self.find_cards_path = self.base_dir / "find_cards.exe"
         self.solution_path = self.base_dir / "solution.txt"
+        self.main_window_handle: Optional[int] = None
 
         if running:
             self.app = self._connect_to_game()
         else:
             self.app = Application(backend="win32").start(str(self.exe_path))
 
-        self.window = self.app.window(title_re="FreeCell.*")
-        self.window.wait("visible ready", timeout=15)
+        self.window = self._resolve_main_window()
         self.window.set_focus()
 
     def _connect_to_game(self) -> Application:
+        candidates = []
+        for candidate in Desktop(backend="win32").windows():
+            if not candidate.is_visible():
+                continue
+            if not re.match(r"FreeCell.*", candidate.window_text() or ""):
+                continue
+            candidates.append(candidate)
+
+        if not candidates:
+            raise RuntimeError("Could not find a running FreeCell window to attach to.")
+
+        candidates.sort(key=lambda window: (window.process_id(), window.handle))
+        chosen = candidates[0]
+        print(
+            f"[debug] Attaching to running FreeCell process={chosen.process_id()} "
+            f"handle={chosen.handle} title={chosen.window_text()!r} among {len(candidates)} candidate(s)"
+        )
+
         app = Application(backend="win32")
-        try:
-            app.connect(path=str(self.exe_path))
-        except Exception:
-            app.connect(title_re="FreeCell.*")
+        app.connect(process=chosen.process_id())
+        self.main_window_handle = chosen.handle
         return app
 
     def _refresh_window(self) -> None:
-        self.window = self.app.window(title_re="FreeCell.*")
+        self.window = self._resolve_main_window()
         self.window.wait("visible ready", timeout=15)
+
+    def _resolve_main_window(self):
+        if self.main_window_handle is not None:
+            window = self.app.window(handle=self.main_window_handle)
+            if window.exists(timeout=1):
+                return window
+
+        candidates = []
+        for candidate in Desktop(backend="win32").windows(process=self.app.process):
+            if not candidate.is_visible():
+                continue
+            if not re.match(r"FreeCell.*", candidate.window_text() or ""):
+                continue
+            candidates.append(candidate)
+
+        if not candidates:
+            raise RuntimeError("Could not find the main FreeCell window.")
+
+        candidates.sort(key=lambda window: (window.handle, window.window_text()))
+        chosen = candidates[0]
+        self.main_window_handle = chosen.handle
+        print(
+            f"[debug] Selected FreeCell window handle={chosen.handle} "
+            f"title={chosen.window_text()!r} among {len(candidates)} candidate(s)"
+        )
+        return self.app.window(handle=chosen.handle)
 
     def _process_id(self) -> int:
         return int(self.window.element_info.process_id)
@@ -205,10 +258,17 @@ class AutoSolver:
     def play_solution(self, board_state: BoardState, solution: list[str], move_delay: float = 0.12) -> None:
         self._bring_to_front()
 
-        for raw_move in solution:
+        for move_number, raw_move in enumerate(solution, start=1):
             move = self._parse_move(raw_move)
-            self._execute_move(board_state, move)
+            if SKIP_FOUNDATION_MOVES and move.dst_kind == "foundation":
+                print(f"[debug] Skipping move {move_number}: {move.raw}")
+                self._apply_move_to_state(board_state, move)
+                continue
+            self._execute_move(board_state, move_number, move)
             self._handle_single_card_popup()
+            invalid_message = self._handle_invalid_move_popup()
+            if invalid_message and INVALID_MOVE_IS_FATAL:
+                raise RuntimeError(f"FreeCell rejected move {move_number}: {move.raw} | dialog={invalid_message}")
             time.sleep(move_delay)
 
     def _bring_to_front(self) -> None:
@@ -246,17 +306,22 @@ class AutoSolver:
             return "column", int(match.group(1)) - 1
         raise ValueError(f"Unrecognized location: {place}")
 
-    def _execute_move(self, board_state: BoardState, move: Move) -> None:
+    def _execute_move(self, board_state: BoardState, move_number: int, move: Move) -> None:
         src_point = self._source_point(board_state, move)
         dst_point = self._destination_point(board_state, move)
+        print(
+            f"[debug] Move {move_number}: {move.raw} | "
+            f"src={src_point} dst={dst_point} "
+            f"freecells={board_state.freecells} foundations={board_state.foundations}"
+        )
 
-        mouse.press(button="left", coords=src_point)
-        time.sleep(0.04)
-        mouse.move(coords=dst_point)
-        time.sleep(0.04)
-        mouse.release(button="left", coords=dst_point)
+        self._send_pick_and_place(src_point, dst_point)
 
         self._apply_move_to_state(board_state, move)
+        print(
+            f"[debug] Move {move_number} applied | "
+            f"freecells={board_state.freecells} foundations={board_state.foundations}"
+        )
 
     def _source_point(self, board_state: BoardState, move: Move) -> tuple[int, int]:
         if move.src_kind == "column":
@@ -264,11 +329,11 @@ class AutoSolver:
             depth = len(board_state.columns[move.src_index]) - 1
             if depth < 0:
                 raise RuntimeError(f"Column {move.src_index + 1} is empty before move: {move.raw}")
-            return self._column_card_point(move.src_index, depth)
+            return self._source_column_point(move.src_index, depth)
 
         if move.src_kind == "freecell":
             slot = self._find_freecell_slot(board_state, move.card)
-            return self._slot_point(slot)
+            return self._freecell_source_point(slot)
 
         raise RuntimeError(f"Unsupported move source: {move.raw}")
 
@@ -276,11 +341,11 @@ class AutoSolver:
         if move.dst_kind == "column":
             assert move.dst_index is not None
             depth = len(board_state.columns[move.dst_index]) - 1
-            return self._empty_column_point(move.dst_index) if depth < 0 else self._column_card_point(move.dst_index, depth)
+            return self._empty_column_point(move.dst_index) if depth < 0 else self._target_column_point(move.dst_index, depth)
 
         if move.dst_kind == "freecell":
             slot = self._first_empty_freecell(board_state)
-            return self._slot_point(slot)
+            return self._freecell_target_point(slot)
 
         if move.dst_kind == "foundation":
             return self._foundation_point(SUIT_INDEX[move.card[-1]])
@@ -342,10 +407,45 @@ class AutoSolver:
             buttons = [child for child in dialog.children() if child.friendly_class_name() == "Button"]
             preferred = self._pick_single_card_button(buttons)
             if preferred is None:
+                print("[debug] Choice dialog detected but no button could be selected")
                 return
 
+            print(
+                f"[debug] Choice dialog handle={dialog.handle} title={dialog.window_text()!r} "
+                f"buttons={[button.window_text() for button in buttons]} "
+                f"selected={preferred.window_text()!r}"
+            )
             preferred.click()
             time.sleep(0.15)
+
+    def _handle_invalid_move_popup(self) -> Optional[str]:
+        deadline = time.time() + 1.5
+        while time.time() < deadline:
+            dialog = self._find_invalid_move_dialog()
+            if not dialog:
+                return None
+
+            buttons = [child for child in dialog.children() if child.friendly_class_name() == "Button"]
+            ok_button = self._pick_ok_button(buttons)
+            texts = [dialog.window_text()]
+            texts.extend(child.window_text() for child in dialog.children())
+            message = " | ".join(text for text in texts if text)
+            if ok_button is None:
+                print(
+                    f"[debug] Invalid move dialog handle={dialog.handle} title={dialog.window_text()!r} "
+                    "but no OK button was found"
+                )
+                return message
+
+            print(
+                f"[debug] Invalid move dialog handle={dialog.handle} title={dialog.window_text()!r} "
+                f"buttons={[button.window_text() for button in buttons]} "
+                f"selected={ok_button.window_text()!r}"
+            )
+            ok_button.click()
+            time.sleep(0.15)
+            return message
+        return None
 
     def _find_choice_dialog(self):
         self._refresh_window()
@@ -355,6 +455,24 @@ class AutoSolver:
             dialog = self.app.window(handle=candidate.handle)
             if dialog.exists(timeout=0.2):
                 return dialog
+        return None
+
+    def _find_invalid_move_dialog(self):
+        self._refresh_window()
+        for candidate in Desktop(backend="win32").windows(process=self._process_id()):
+            if candidate.handle == self.window.handle or not candidate.is_visible():
+                continue
+
+            dialog = self.app.window(handle=candidate.handle)
+            if not dialog.exists(timeout=0.2):
+                continue
+
+            texts = [dialog.window_text()]
+            texts.extend(child.window_text() for child in dialog.children())
+            normalized = " ".join(text for text in texts if text).lower()
+            if "invalid move" in normalized:
+                return dialog
+
         return None
 
     @staticmethod
@@ -378,11 +496,32 @@ class AutoSolver:
 
         return buttons[0]
 
+    @staticmethod
+    def _pick_ok_button(buttons):
+        for button in buttons:
+            if button.window_text().strip().lower() in {"ok", "&ok"}:
+                return button
+        if len(buttons) == 1:
+            return buttons[0]
+        return None
+
     def _slot_point(self, slot_index: int) -> tuple[int, int]:
         metrics = self._board_metrics()
         x = metrics["left_margin"] + slot_index * metrics["slot_pitch"] + (metrics["card_width"] / 2.0)
         y = metrics["top_slots_top"] + (metrics["card_height"] / 2.0)
-        return self._client_to_screen(x, y)
+        return self._client_point(x, y)
+
+    def _freecell_source_point(self, slot_index: int) -> tuple[int, int]:
+        metrics = self._board_metrics()
+        x = metrics["left_margin"] + slot_index * metrics["slot_pitch"] + (metrics["card_width"] / 2.0)
+        y = metrics["top_slots_top"] + min(metrics["card_height"] * 0.60, 52.0)
+        return self._client_point(x, y)
+
+    def _freecell_target_point(self, slot_index: int) -> tuple[int, int]:
+        metrics = self._board_metrics()
+        x = metrics["left_margin"] + slot_index * metrics["slot_pitch"] + (metrics["card_width"] / 2.0)
+        y = metrics["top_slots_top"] + min(metrics["card_height"] * 0.30, 28.0)
+        return self._client_point(x, y)
 
     def _foundation_point(self, foundation_index: int) -> tuple[int, int]:
         return self._slot_point(4 + foundation_index)
@@ -391,13 +530,19 @@ class AutoSolver:
         metrics = self._board_metrics()
         x = metrics["left_margin"] + column_index * metrics["slot_pitch"] + (metrics["card_width"] / 2.0)
         y = metrics["tableau_top"] + (metrics["card_height"] / 2.0)
-        return self._client_to_screen(x, y)
+        return self._client_point(x, y)
 
-    def _column_card_point(self, column_index: int, depth: int) -> tuple[int, int]:
+    def _source_column_point(self, column_index: int, depth: int) -> tuple[int, int]:
         metrics = self._board_metrics()
         x = metrics["left_margin"] + column_index * metrics["slot_pitch"] + (metrics["card_width"] / 2.0)
-        y = metrics["tableau_top"] + depth * metrics["card_step"] + min(metrics["card_height"] * 0.35, 34.0)
-        return self._client_to_screen(x, y)
+        y = metrics["tableau_top"] + depth * metrics["card_step"] + min(metrics["card_height"] * 0.60, 52.0)
+        return self._client_point(x, y)
+
+    def _target_column_point(self, column_index: int, depth: int) -> tuple[int, int]:
+        metrics = self._board_metrics()
+        x = metrics["left_margin"] + column_index * metrics["slot_pitch"] + (metrics["card_width"] / 2.0)
+        y = metrics["tableau_top"] + depth * metrics["card_step"] + max(8.0, min(metrics["card_step"] * 0.5, 18.0))
+        return self._client_point(x, y)
 
     def _board_metrics(self) -> dict[str, float]:
         rect = self.window.client_rect()
@@ -422,9 +567,36 @@ class AutoSolver:
             "card_step": card_step,
         }
 
-    def _client_to_screen(self, x: float, y: float) -> tuple[int, int]:
-        client_x, client_y = self.window.client_to_screen((int(round(x)), int(round(y))))
-        return int(client_x), int(client_y)
+    @staticmethod
+    def _client_point(x: float, y: float) -> tuple[int, int]:
+        return int(round(x)), int(round(y))
+
+    @staticmethod
+    def _make_lparam(point: tuple[int, int]) -> int:
+        x, y = point
+        return (y << 16) | (x & 0xFFFF)
+
+    def _send_mouse_message(self, msg: int, wparam: int, point: tuple[int, int]) -> None:
+        ctypes.windll.user32.SendMessageW(
+            int(self.window.handle),
+            msg,
+            wparam,
+            self._make_lparam(point),
+        )
+
+    def _send_click(self, point: tuple[int, int]) -> None:
+        self.window.set_focus()
+        self._send_mouse_message(WM_MOUSEMOVE, 0, point)
+        time.sleep(0.02)
+        self._send_mouse_message(WM_LBUTTONDOWN, MK_LBUTTON, point)
+        time.sleep(0.03)
+        self._send_mouse_message(WM_LBUTTONUP, 0, point)
+        time.sleep(0.03)
+
+    def _send_pick_and_place(self, src_point: tuple[int, int], dst_point: tuple[int, int]) -> None:
+        self._send_click(src_point)
+        time.sleep(0.04)
+        self._send_click(dst_point)
 
 
 def main() -> None:
