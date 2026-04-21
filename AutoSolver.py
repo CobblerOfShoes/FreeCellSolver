@@ -41,6 +41,7 @@ class BoardState:
     columns: list[list[str]]
     freecells: list[Optional[str]]
     foundations: list[int]
+    foundation_slots: list[Optional[str]]
 
 
 @dataclass
@@ -60,6 +61,7 @@ class AutoSolver:
         self.find_cards_path = self.base_dir / "find_cards.exe"
         self.solution_path = self.base_dir / "solution.txt"
         self.main_window_handle: Optional[int] = None
+        self.foundation_slot_by_suit: dict[str, int] = {}
 
         if running:
             self.app = self._connect_to_game()
@@ -236,7 +238,9 @@ class AutoSolver:
         ints = struct.unpack("<193i", payload)
 
         cards = ints[:189]
-        foundations = list(decode_foundations(ints[189:193]))
+        raw_foundations = ints[189:193]
+        foundations = list(decode_foundations(raw_foundations))
+        foundation_slots = [decode_card(value) for value in raw_foundations]
         freecells = [decode_card(cards[i]) for i in range(4)]
 
         columns: list[list[str]] = [[] for _ in range(8)]
@@ -248,7 +252,12 @@ class AutoSolver:
                     break
                 columns[col_idx].append(card)
 
-        return BoardState(columns=columns, freecells=freecells, foundations=foundations)
+        return BoardState(
+            columns=columns,
+            freecells=freecells,
+            foundations=foundations,
+            foundation_slots=foundation_slots,
+        )
 
     def _write_solution(self, solution: list[str]) -> None:
         with self.solution_path.open("w", encoding="utf-8") as handle:
@@ -259,7 +268,14 @@ class AutoSolver:
         self._bring_to_front()
 
         for move_number, raw_move in enumerate(solution, start=1):
+            board_state = self._capture_board_snapshot()
+            self._sync_foundation_slot_map(board_state)
             move = self._parse_move(raw_move)
+            source_mismatch = self._source_mismatch(board_state, move)
+            if source_mismatch:
+                print(f"[debug] Skipping move {move_number}: {move.raw} | {source_mismatch}")
+                continue
+            self._ensure_live_foundation_mapping(board_state, move)
             if SKIP_FOUNDATION_MOVES and move.dst_kind == "foundation":
                 print(f"[debug] Skipping move {move_number}: {move.raw}")
                 self._apply_move_to_state(board_state, move)
@@ -309,8 +325,11 @@ class AutoSolver:
     def _execute_move(self, board_state: BoardState, move_number: int, move: Move) -> None:
         src_point = self._source_point(board_state, move)
         dst_point = self._destination_point(board_state, move)
+        src_label = self._describe_source(board_state, move)
+        dst_label = self._describe_destination(board_state, move)
         print(
             f"[debug] Move {move_number}: {move.raw} | "
+            f"source={src_label} destination={dst_label} "
             f"src={src_point} dst={dst_point} "
             f"freecells={board_state.freecells} foundations={board_state.foundations}"
         )
@@ -348,9 +367,42 @@ class AutoSolver:
             return self._freecell_target_point(slot)
 
         if move.dst_kind == "foundation":
-            return self._foundation_point(SUIT_INDEX[move.card[-1]])
+            return self._foundation_point(self._foundation_slot_for_suit(board_state, move.card[-1]))
 
         raise RuntimeError(f"Unsupported move destination: {move.raw}")
+
+    def _describe_source(self, board_state: BoardState, move: Move) -> str:
+        if move.src_kind == "column":
+            assert move.src_index is not None
+            return f"Column {move.src_index + 1}"
+
+        if move.src_kind == "freecell":
+            slot = self._find_freecell_slot(board_state, move.card)
+            return f"FreeCell {slot + 1}"
+
+        return move.src_kind
+
+    def _describe_destination(self, board_state: BoardState, move: Move) -> str:
+        if move.dst_kind == "column":
+            assert move.dst_index is not None
+            return f"Column {move.dst_index + 1}"
+
+        if move.dst_kind == "freecell":
+            slot = self._first_empty_freecell(board_state)
+            return f"FreeCell {slot + 1}"
+
+        if move.dst_kind == "foundation":
+            suit = move.card[-1]
+            foundation_slot = self._foundation_slot_for_suit(board_state, suit) + 1
+            suit_name = {
+                "S": "Spades",
+                "D": "Diamonds",
+                "H": "Hearts",
+                "C": "Clubs",
+            }[suit]
+            return f"Foundation {foundation_slot} ({suit_name})"
+
+        return move.dst_kind
 
     def _apply_move_to_state(self, board_state: BoardState, move: Move) -> None:
         if move.src_kind == "column":
@@ -379,9 +431,33 @@ class AutoSolver:
         if move.dst_kind == "foundation":
             suit_index = SUIT_INDEX[move.card[-1]]
             board_state.foundations[suit_index] += 1
+            slot_index = self._foundation_slot_for_suit(board_state, move.card[-1])
+            board_state.foundation_slots[slot_index] = move.card
             return
 
         raise RuntimeError(f"Unsupported move destination: {move.raw}")
+
+    def _source_mismatch(self, board_state: BoardState, move: Move) -> Optional[str]:
+        if move.src_kind == "column":
+            assert move.src_index is not None
+            column = board_state.columns[move.src_index]
+            if not column:
+                return f"source column {move.src_index + 1} is empty"
+            if column[-1] != move.card:
+                return (
+                    f"expected {move.card} on top of column {move.src_index + 1}, "
+                    f"found {column[-1]}"
+                )
+            return None
+
+        if move.src_kind == "freecell":
+            try:
+                self._find_freecell_slot(board_state, move.card)
+            except RuntimeError:
+                return f"expected {move.card} in a freecell, but it is no longer there"
+            return None
+
+        return f"unsupported move source: {move.raw}"
 
     @staticmethod
     def _find_freecell_slot(board_state: BoardState, card: str) -> int:
@@ -396,6 +472,58 @@ class AutoSolver:
             if value is None:
                 return index
         raise RuntimeError("No empty freecell slot is available.")
+
+    @staticmethod
+    def _first_empty_foundation_slot(board_state: BoardState) -> int:
+        for index, value in enumerate(board_state.foundation_slots):
+            if value is None:
+                return index
+        raise RuntimeError("No empty foundation slot is available.")
+
+    def _sync_foundation_slot_map(self, board_state: BoardState) -> None:
+        for index, value in enumerate(board_state.foundation_slots):
+            if value:
+                suit = value[-1]
+                mapped_index = self.foundation_slot_by_suit.get(suit)
+                if mapped_index is not None and mapped_index != index:
+                    print(
+                        f"[debug] Foundation slot remap for suit {suit}: "
+                        f"{mapped_index + 1} -> {index + 1}"
+                    )
+                self.foundation_slot_by_suit[suit] = index
+
+    def _foundation_slot_for_suit(self, board_state: BoardState, suit: str) -> int:
+        mapped_index = self.foundation_slot_by_suit.get(suit)
+        if mapped_index is not None:
+            return mapped_index
+
+        self._sync_foundation_slot_map(board_state)
+        mapped_index = self.foundation_slot_by_suit.get(suit)
+        if mapped_index is not None:
+            return mapped_index
+
+        mapped_index = self._first_empty_foundation_slot(board_state)
+        self.foundation_slot_by_suit[suit] = mapped_index
+        print(f"[debug] Assigned suit {suit} to foundation slot {mapped_index + 1}")
+        return mapped_index
+
+    def _ensure_live_foundation_mapping(self, board_state: BoardState, move: Move) -> None:
+        if move.dst_kind != "foundation":
+            return
+
+        suit = move.card[-1]
+        if suit in self.foundation_slot_by_suit:
+            return
+
+        for index, value in enumerate(board_state.foundation_slots):
+            if value and value[-1] == suit:
+                self.foundation_slot_by_suit[suit] = index
+                print(
+                    f"[debug] Learned live foundation slot for suit {suit}: "
+                    f"slot {index + 1} from {value}"
+                )
+                return
+
 
     def _handle_single_card_popup(self) -> None:
         deadline = time.time() + 1.5

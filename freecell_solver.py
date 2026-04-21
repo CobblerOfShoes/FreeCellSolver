@@ -26,19 +26,20 @@ def decode_card(v):
 
 def decode_foundations(raw_foundations):
     ranks = [0, 0, 0, 0]
-    for suit_idx, v in enumerate(raw_foundations):
+    for slot_idx, v in enumerate(raw_foundations):
         if v == -1 or v == 0xffffffff:
-            ranks[suit_idx] = 0
             continue
         if 0 <= v <= 51:
-            if v % 4 != suit_idx:
+            suit_idx = v % 4
+            rank = (v // 4) + 1
+            if ranks[suit_idx] and ranks[suit_idx] != rank:
                 print(
-                    f"Warning: foundation slot {suit_idx} contains suit {v % 4}, expected {suit_idx}"
+                    f"Warning: conflicting foundation values for suit {suit_idx}: "
+                    f"{ranks[suit_idx]} vs {rank} from slot {slot_idx}"
                 )
-            ranks[suit_idx] = (v // 4) + 1
+            ranks[suit_idx] = max(ranks[suit_idx], rank)
         else:
-            print(f"Warning: invalid foundation value {v} in slot {suit_idx}")
-            ranks[suit_idx] = 0
+            print(f"Warning: invalid foundation value {v} in slot {slot_idx}")
     return tuple(ranks)
 
 def read_exact(sock, size):
