@@ -13,7 +13,7 @@ CARD_PORT = 5000
 FRAME_SIZE = 772
 
 rank_symbols = ['A','2','3','4','5','6','7','8','9','0','J','Q','K']
-suit_symbols = ['S','D','H','C']
+suit_symbols = ['C','D','H','S']
 
 def decode_card(v):
     if v == -1 or v == 0xffffffff:
@@ -108,8 +108,8 @@ class FreeCellSolver:
             tuple(foundations)
         )
 
-        self.suits_idx = {'S':0,'D':1,'H':2,'C':3}
-        self.idx_suits = {0:'S',1:'D',2:'H',3:'C'}
+        self.suits_idx = {'C':0,'D':1,'H':2,'S':3}
+        self.idx_suits = {0:'C',1:'D',2:'H',3:'S'}
 
         self.rank_map = {str(i): i for i in range(2,10)}
         self.rank_map.update({'A':1,'0':10,'J':11,'Q':12,'K':13})

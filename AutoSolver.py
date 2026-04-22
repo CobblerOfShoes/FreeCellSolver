@@ -269,13 +269,11 @@ class AutoSolver:
 
         for move_number, raw_move in enumerate(solution, start=1):
             board_state = self._capture_board_snapshot()
-            self._sync_foundation_slot_map(board_state)
             move = self._parse_move(raw_move)
             source_mismatch = self._source_mismatch(board_state, move)
             if source_mismatch:
                 print(f"[debug] Skipping move {move_number}: {move.raw} | {source_mismatch}")
                 continue
-            self._ensure_live_foundation_mapping(board_state, move)
             if SKIP_FOUNDATION_MOVES and move.dst_kind == "foundation":
                 print(f"[debug] Skipping move {move_number}: {move.raw}")
                 self._apply_move_to_state(board_state, move)
@@ -473,56 +471,22 @@ class AutoSolver:
                 return index
         raise RuntimeError("No empty freecell slot is available.")
 
-    @staticmethod
-    def _first_empty_foundation_slot(board_state: BoardState) -> int:
-        for index, value in enumerate(board_state.foundation_slots):
-            if value is None:
+    def _first_unassigned_foundation_slot(self) -> int:
+        assigned = set(self.foundation_slot_by_suit.values())
+        for index in range(4):
+            if index not in assigned:
                 return index
-        raise RuntimeError("No empty foundation slot is available.")
-
-    def _sync_foundation_slot_map(self, board_state: BoardState) -> None:
-        for index, value in enumerate(board_state.foundation_slots):
-            if value:
-                suit = value[-1]
-                mapped_index = self.foundation_slot_by_suit.get(suit)
-                if mapped_index is not None and mapped_index != index:
-                    print(
-                        f"[debug] Foundation slot remap for suit {suit}: "
-                        f"{mapped_index + 1} -> {index + 1}"
-                    )
-                self.foundation_slot_by_suit[suit] = index
+        raise RuntimeError("No foundation slot is available.")
 
     def _foundation_slot_for_suit(self, board_state: BoardState, suit: str) -> int:
         mapped_index = self.foundation_slot_by_suit.get(suit)
         if mapped_index is not None:
             return mapped_index
 
-        self._sync_foundation_slot_map(board_state)
-        mapped_index = self.foundation_slot_by_suit.get(suit)
-        if mapped_index is not None:
-            return mapped_index
-
-        mapped_index = self._first_empty_foundation_slot(board_state)
+        mapped_index = self._first_unassigned_foundation_slot()
         self.foundation_slot_by_suit[suit] = mapped_index
-        print(f"[debug] Assigned suit {suit} to foundation slot {mapped_index + 1}")
+        print(f"[debug] Locked suit {suit} to foundation slot {mapped_index + 1}")
         return mapped_index
-
-    def _ensure_live_foundation_mapping(self, board_state: BoardState, move: Move) -> None:
-        if move.dst_kind != "foundation":
-            return
-
-        suit = move.card[-1]
-        if suit in self.foundation_slot_by_suit:
-            return
-
-        for index, value in enumerate(board_state.foundation_slots):
-            if value and value[-1] == suit:
-                self.foundation_slot_by_suit[suit] = index
-                print(
-                    f"[debug] Learned live foundation slot for suit {suit}: "
-                    f"slot {index + 1} from {value}"
-                )
-                return
 
 
     def _handle_single_card_popup(self) -> None:
